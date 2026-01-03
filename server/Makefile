@@ -5,14 +5,15 @@ else
 CC := gcc
 endif
 
-CFLAGS += -Wall -Werror
+CFLAGS ?= -Wall -Werror
+LDFLAGS ?=
 
 .PHONY: all default clean
 
 all: default
 
 default:
-	$(CC) $(CFLAGS) -o aesdsocket aesdsocket.c
+	$(CC) $(CFLAGS) $(LDFLAGS) -o aesdsocket aesdsocket.c
 
 clean:	
 	rm -f *.o aesdsocket
