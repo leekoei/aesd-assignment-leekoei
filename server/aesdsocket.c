@@ -4,9 +4,11 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/queue.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
@@ -15,6 +17,7 @@
 #include <syslog.h>
 #include <time.h>
 #include <unistd.h>
+#include "../aesd-char-driver/aesd_ioctl.h"
 
 #ifndef USE_AESD_CHAR_DEVICE
 #define USE_AESD_CHAR_DEVICE 1
@@ -64,68 +67,145 @@ static pthread_mutex_t mutex;
 
 void * thread_func(void* thread_param) {
     struct thread_data *data = (struct thread_data *)thread_param;
-    FILE *file = NULL;
+    int fd = -1;
     int socket_client = data->sock_client;
     char buffer[BUFFER_SIZE];
+    char receive_buffer[BUFFER_SIZE];
     ssize_t bytes_received;
+    size_t total_received = 0;
+    bool is_seek_command = false;
+    uint32_t write_cmd = 0;
+    uint32_t write_cmd_offset = 0;
 
-    /* Open a file to store the received data */
-    file = fopen(FILE_PATH, "a+");
-    if (file == NULL) {
+    /* Open the device file */
+    fd = open(FILE_PATH, O_RDWR);
+    if (fd == -1) {
         printf("Failed to open file\n");
         return NULL;
     }
 
     // Obtain the mutex
     if ( pthread_mutex_lock(data->mutex) ) {
-        if (file) fclose(file);
+        if (fd >= 0) close(fd);
         return NULL;
     }
 
-    /* Receive data from the client and write to the file */
+    /* Receive data from the client */
     while ((bytes_received = recv(socket_client, buffer, sizeof(buffer), 0)) > 0) {
-        fwrite(buffer, 1, bytes_received, file);
+        if (total_received + bytes_received >= sizeof(receive_buffer)) {
+            /* Buffer overflow - treat as regular data */
+            break;
+        }
+        memcpy(receive_buffer + total_received, buffer, bytes_received);
+        total_received += bytes_received;
         /* Check for newline character to end reception */
         if (buffer[bytes_received - 1] == '\n') {
             break;
         }
     }
 
-    fflush(file);
-    if (pthread_mutex_unlock(data->mutex)) { fclose(file); return NULL; }
-
-    /* Send the full content of the file back to the client */
-    size_t send_bytes;
-
-    /* Reset file pointer to the beginning */
-    fseek(file, 0, SEEK_SET);
-    while(!is_terminated) {
-        size_t nread = fread(buffer, 1, sizeof(buffer), file);
-        if (nread > 0) {
-            send_bytes = 0;
-            while (send_bytes < nread) {
-                ssize_t sent = send(socket_client, buffer + send_bytes, nread - send_bytes, MSG_NOSIGNAL);
-                if (sent < 0) {
-                    if (errno == EINTR) {
-                        continue; // Retry sending if interrupted
+    /* Check if the received string is the special seek command */
+    if (total_received > 0 && receive_buffer[total_received - 1] == '\n') {
+        /* Create a null-terminated copy for string operations */
+        size_t str_len = total_received - 1; /* Exclude newline */
+        char *temp_buffer = malloc(str_len + 1); /* +1 for null terminator */
+        if (temp_buffer != NULL) {
+            memcpy(temp_buffer, receive_buffer, str_len);
+            temp_buffer[str_len] = '\0';
+            
+            if (strncmp(temp_buffer, "AESDCHAR_IOCSEEKTO:", 19) == 0) {
+                /* Parse X and Y from "AESDCHAR_IOCSEEKTO:X,Y" */
+                char *comma = strchr(temp_buffer + 19, ',');
+                if (comma != NULL) {
+                    char *endptr_x, *endptr_y;
+                    unsigned long x_val, y_val;
+                    
+                    *comma = '\0';
+                    x_val = strtoul(temp_buffer + 19, &endptr_x, 10);
+                    y_val = strtoul(comma + 1, &endptr_y, 10);
+                    
+                    /* Validate that entire strings were consumed and values fit in uint32_t */
+                    if (*endptr_x == '\0' && *endptr_y == '\0' &&
+                        x_val <= UINT32_MAX && y_val <= UINT32_MAX) {
+                        write_cmd = (uint32_t)x_val;
+                        write_cmd_offset = (uint32_t)y_val;
+                        is_seek_command = true;
                     }
-                    printf("Failed to send data to client\n");
-                    return NULL;
                 }
-                send_bytes += sent;
             }
-        }
-        if (nread < sizeof(buffer)) {
-            if (feof(file)) {
-                break; // End of file
-            } else if (ferror(file)) {
-                printf("Failed to read from file\n");
-                return NULL;
-            }
+            free(temp_buffer);
+        } else {
+            /* malloc failed - treat as regular data */
+            printf("Failed to allocate memory for command parsing\n");
         }
     }
 
-    if (file) fclose(file);
+    if (!is_seek_command) {
+        /* Write the received data to the device */
+        ssize_t written = 0;
+        while (written < (ssize_t)total_received) {
+            ssize_t n = write(fd, receive_buffer + written, total_received - written);
+            if (n < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                printf("Failed to write to device\n");
+                if (pthread_mutex_unlock(data->mutex)) { close(fd); return NULL; }
+                if (fd >= 0) close(fd);
+                return NULL;
+            }
+            written += n;
+        }
+        /* Seek to beginning to read all content */
+        if (lseek(fd, 0, SEEK_SET) == -1) {
+            printf("Failed to seek to beginning\n");
+            if (pthread_mutex_unlock(data->mutex)) { close(fd); return NULL; }
+            if (fd >= 0) close(fd);
+            return NULL;
+        }
+    } else {
+        /* Perform ioctl seek command */
+        struct aesd_seekto seekto;
+        seekto.write_cmd = write_cmd;
+        seekto.write_cmd_offset = write_cmd_offset;
+        
+        if (ioctl(fd, AESDCHAR_IOCSEEKTO, &seekto) == -1) {
+            printf("Failed to perform ioctl seek\n");
+            if (pthread_mutex_unlock(data->mutex)) { close(fd); return NULL; }
+            if (fd >= 0) close(fd);
+            return NULL;
+        }
+        /* After ioctl, file position is set by the driver */
+    }
+
+    if (pthread_mutex_unlock(data->mutex)) { close(fd); return NULL; }
+
+    /* Send the content of the device back to the client */
+    /* Read from the device using the same file descriptor */
+    ssize_t nread;
+    while ((nread = read(fd, buffer, sizeof(buffer))) > 0) {
+        size_t send_bytes = 0;
+        while (send_bytes < (size_t)nread) {
+            ssize_t sent = send(socket_client, buffer + send_bytes, nread - send_bytes, MSG_NOSIGNAL);
+            if (sent < 0) {
+                if (errno == EINTR) {
+                    continue; // Retry sending if interrupted
+                }
+                printf("Failed to send data to client\n");
+                if (fd >= 0) close(fd);
+                return NULL;
+            }
+            send_bytes += sent;
+        }
+    }
+
+    if (nread < 0 && errno != EINTR) {
+        printf("Failed to read from device\n");
+        if (fd >= 0) close(fd);
+        return NULL;
+    }
+
+    if (fd >= 0) close(fd);
     if (socket_client >= 0) close(socket_client);
 
     data->thread_complete_success = true;
