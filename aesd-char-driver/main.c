@@ -30,7 +30,7 @@ MODULE_LICENSE("Dual BSD/GPL");
 
 struct aesd_dev aesd_device;
 
-int aesd_open(struct inode *inode, struct file *filp)
+static int aesd_open(struct inode *inode, struct file *filp)
 {
     PDEBUG("open");
     /**
@@ -43,7 +43,7 @@ int aesd_open(struct inode *inode, struct file *filp)
     return 0;
 }
 
-int aesd_release(struct inode *inode, struct file *filp)
+static int aesd_release(struct inode *inode, struct file *filp)
 {
     PDEBUG("release");
     /**
@@ -52,7 +52,7 @@ int aesd_release(struct inode *inode, struct file *filp)
     return 0;
 }
 
-loff_t aesd_llseek(struct file *filp, loff_t offset, int whence)
+static loff_t aesd_llseek(struct file *filp, loff_t offset, int whence)
 {
     struct aesd_dev *dev = filp->private_data;
     loff_t new_pos = 0;
@@ -103,7 +103,7 @@ loff_t aesd_llseek(struct file *filp, loff_t offset, int whence)
     return new_pos;
 }
 
-long aesd_unlocked_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+static long aesd_unlocked_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
     struct aesd_dev *dev = filp->private_data;
     struct aesd_seekto seekto;
@@ -165,7 +165,7 @@ long aesd_unlocked_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
     return -EINVAL;
 }
 
-ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
+static ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
                 loff_t *f_pos)
 {
     PDEBUG("read %zu bytes with offset %lld",count,*f_pos);
@@ -178,7 +178,7 @@ ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
 
     mutex_lock(&dev->lock);
     entry = aesd_circular_buffer_find_entry_offset_for_fpos(&dev->buffer, *f_pos, &entry_offset);
-    if (entry == NULL) {
+    if (!entry || !entry->buffptr || entry_offset >= entry->size) {
         mutex_unlock(&dev->lock);
         return 0;
     }
@@ -199,46 +199,41 @@ ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
     return bytes_to_copy;
 }
 
-ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
+static ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
                 loff_t *f_pos)
 {
     ssize_t retval = -ENOMEM;
     struct aesd_dev *dev = filp->private_data;
-    size_t size = dev->entry.size;
-    size_t bytes_to_copy = 0;
+    size_t size;
+    size_t not_copied;
+    char *newbuf;
 
-    PDEBUG("write %zu bytes with offset %lld",count,*f_pos);
-    /**
-     * TODO: handle write
-     */
+    if (count == 0)
+        return 0;
 
     mutex_lock(&dev->lock);
-    if (size == 0) {
-        /* The case when the current entry is empty */
-        dev->entry.buffptr = kmalloc(count, GFP_KERNEL);
-    } else {
-        /* The case when the current entry is pending more data */
-        int size_new = size + count;
-        dev->entry.buffptr = krealloc((void *)dev->entry.buffptr, size_new, GFP_KERNEL);
-    }
 
-    if (dev->entry.buffptr == NULL) {
+    size = dev->entry.size;
+    if (size == 0)
+        newbuf = kmalloc(count, GFP_KERNEL);
+    else
+        newbuf = krealloc((void *)dev->entry.buffptr, size + count, GFP_KERNEL);
+
+    if (!newbuf) {
         mutex_unlock(&dev->lock);
-        return retval;
+        return -ENOMEM;
     }
 
-    bytes_to_copy = copy_from_user((char *)dev->entry.buffptr + size, buf, count);
-    retval = count - bytes_to_copy;
+    dev->entry.buffptr = newbuf;
+
+    not_copied = copy_from_user((char *)dev->entry.buffptr + size, buf, count);
+    retval = count - not_copied;
     dev->entry.size += retval;
 
-    if (buf[count - 1] == '\n') {
-        /* Add the entry to the circular buffer */
-        const char *overwritten_buffptr = aesd_circular_buffer_add_entry(&dev->buffer, &dev->entry);
-        if (overwritten_buffptr != NULL) {
-            kfree((void *)overwritten_buffptr);
-        }
-
-        /* Reset the current entry */
+    if ((retval > 0) && (((char *)dev->entry.buffptr)[dev->entry.size - 1] == '\n')) {
+        const char *overwritten = aesd_circular_buffer_add_entry(&dev->buffer, &dev->entry);
+        if (overwritten)
+            kfree((void *)overwritten);
         dev->entry.buffptr = NULL;
         dev->entry.size = 0;
     }
@@ -271,7 +266,7 @@ static int aesd_setup_cdev(struct aesd_dev *dev)
     return err;
 }
 
-int aesd_init_module(void)
+static int aesd_init_module(void)
 {
     dev_t dev = 0;
     int result;
@@ -302,7 +297,7 @@ int aesd_init_module(void)
 
 }
 
-void aesd_cleanup_module(void)
+static void aesd_cleanup_module(void)
 {
     uint8_t index;
     struct aesd_buffer_entry *entryptr;
